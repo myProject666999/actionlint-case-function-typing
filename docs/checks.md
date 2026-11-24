@@ -373,6 +373,86 @@ test.yaml:19:14: type of expression at "env" must be object but found type strin
 
 In above example, environment variables mapping is expanded at `env:` section. actionlint checks type of the expanded value.
 
+### Type of `case()` calls
+
+The [`case()` function][case-doc] evaluates predicates in order and returns the value paired with the first true
+predicate. The last argument is the default value:
+
+```
+case(pred1, val1, pred2, val2, ..., default)
+```
+
+It takes an odd number of arguments, at least three. When the number of arguments is even, actionlint reports the
+existing `case() requires an odd number of arguments ...` error.
+
+Previously the result type of a `case()` call was always `any`. It is now the left-to-right fold of the existing
+`Merge` type rule over all value arguments (`val1`, `val2`, ...) and the default value. Predicate types do not
+participate in the fold. When merged types conflict, the result falls back to `any` exactly as elsewhere in the type
+checker; no `case()`-specific degeneration rule is added. For example:
+
+| Expression                                             | Deduced type                                                    |
+|--------------------------------------------------------|-----------------------------------------------------------------|
+| `case(a, 'x', b, 'y', 'z')`                            | `string`                                                        |
+| `case(a, 1, 'two')`                                    | `string` (`number` merged with `string` keeps `string`)         |
+| `case(a, true, 1)`                                     | `any` (`bool` merged with `number` conflicts)                   |
+| `case(a, 'v', null)`                                   | `any` (merging with `null` falls back to `any`)                 |
+| `case(a, fromJSON('{"a":1}'), fromJSON('{"b":2}'))`    | `{a: number; b: number}` (strict objects merge their props)    |
+| `case(a, fromJSON('[1]'), fromJSON('["x"]'))`          | `array<string>` (element types merge recursively)                |
+
+All arguments are still checked normally. A predicate that references an undefined variable or property, or that calls
+a special function unavailable at the current position, still produces its usual diagnostic. Logical expression values
+reuse the same type narrowing as ordinary expressions: when `v1` is a truthy literal (a non-empty string or a non-zero
+number), `case(p, v1, v2)` deduces the exact same type as the equivalent `p && v1 || v2` expression. (When `v1` can be
+falsy — `''`, `0`, `null`, or `false` — the two forms are not runtime-equivalent because `&&`/`||` would skip a falsy
+`v1`; actionlint does not model literal truthiness.)
+
+Merging strict object branches, such as objects returned by `fromJSON()` with JSON object literals, keeps the merged
+object strict and unions their properties. Property existence checks therefore work on `case()` results.
+
+This more precise type can reveal pre-existing type mismatches at positions with type requirements (`timeout-minutes`,
+`runs-on`, `matrix`, `with`, ...). The diagnostics themselves are the ordinary assignment checks for those positions;
+no new diagnostic mentioning `case()` is added, and conflicting branch types merging into `any` is not an error by
+itself. As before, actionlint does not allow implicit conversion to `number`, so a `string` result at a number position
+is reported just like a plain string expression would be, even though the GitHub runtime coerces some such strings.
+
+This example now triggers a diagnostic because `10` merged with `'long'` yields `string`:
+
+```yaml
+on: push
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      # ERROR: type of expression at "float number value" must be number but found type string
+      - run: echo ok
+        timeout-minutes: ${{ case(github.event_name == 'push', 10, 'long') }}
+```
+
+These examples do not trigger a new diagnostic: both number branches yield `number`, and a `string` branch merged with
+a string-array branch falls back to `any`, which is accepted at `runs-on`:
+
+```yaml
+on: push
+jobs:
+  test:
+    runs-on: ${{ case(github.event_name == 'push', 'ubuntu-latest', fromJSON('["self-hosted", "linux"]')) }}
+    timeout-minutes: ${{ case(github.event_name == 'push', 10, 20) }}
+    steps:
+      - run: echo ok
+```
+
+**Compatibility note.** Older actionlint versions typed every `case()` call as `any`, so positions receiving the result
+were effectively unchecked. After this change, workflows that were previously clean may get new diagnostics when the
+merged branch type does not match the position's expected type. To suppress them, either add an `ignore` regular
+expression for the diagnostic message in the [actionlint configuration][config-ignore] (or the equivalent `-ignore`
+command line option), or widen/split the expression so its type stays permissive — for example route a dynamic value
+through `fromJSON(...)` with a non-literal argument, which is typed `any`, or restructure the selection so each
+`case()` only merges values compatible with the position. actionlint does not check whether the runner version supports
+the `case()` built-in function.
+
+[case-doc]: https://docs.github.com/en/actions/reference/workflows-and-actions/expressions#case
+[config-ignore]: config.md#configuration-file
+
 <a id="check-contexts-and-builtin-func"></a>
 ## Contexts and built-in functions
 

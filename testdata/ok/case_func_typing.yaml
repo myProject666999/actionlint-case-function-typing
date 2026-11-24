@@ -1,0 +1,36 @@
+on: push
+
+jobs:
+  case-typing-ok:
+    # String merged with string array falls back to any, which is accepted at runs-on.
+    runs-on: ${{ case(github.event_name == 'push', 'ubuntu-latest', fromJSON('["self-hosted", "linux"]')) }}
+    # Both branches are numbers, so the result stays number.
+    timeout-minutes: ${{ case(github.event_name == 'push', 10, 20) }}
+    if: ${{ case(github.event_name == 'push', true, false) }}
+    strategy:
+      matrix:
+        # case() result is any (string merged with array), so matrix.label stays permissive.
+        label:
+          - ${{ case(github.event_name == 'push', 'ubuntu-latest', fromJSON('["self-hosted", "linux"]')) }}
+        # Two strict fromJSON() objects merge into the union of properties {a, b}.
+        obj:
+          - ${{ case(github.event_name == 'push', fromJSON('{"a":1}'), fromJSON('{"b":2}')) }}
+    env:
+      CASE_STRING: ${{ case(github.event_name == 'push', 'production', 'development') }}
+      # String merged with null falls back to any, which is allowed in env values.
+      CASE_NULL: ${{ case(github.event_name == 'push', 'value', null) }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ case(github.event_name == 'push', github.ref, github.sha) }}
+      - run: echo ${{ matrix.label }}
+      - run: echo ${{ matrix.obj.a }}
+      - run: echo ${{ matrix.obj.b }}
+      - run: echo "$CASE_STRING"
+  case-matrix-expr-ok:
+    runs-on: ubuntu-latest
+    # Two object branches merge into a strict object {os: string}, which is accepted at matrix.
+    strategy:
+      matrix: ${{ case(github.event_name == 'push', fromJSON('{"os":"ubuntu-latest"}'), fromJSON('{"os":"windows-latest"}')) }}
+    steps:
+      - run: echo ${{ matrix.os }}

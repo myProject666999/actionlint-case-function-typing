@@ -741,42 +741,42 @@ func TestExprSemanticsCheckOK(t *testing.T) {
 		{
 			what:     "case() with single predicate",
 			input:    "case(true, 'a', 'b')",
-			expected: AnyType{},
+			expected: StringType{},
 		},
 		{
 			what:     "case() with multiple predicates",
 			input:    "case(true, 1, false, 2, 3)",
-			expected: AnyType{},
+			expected: NumberType{},
 		},
 		{
 			what:     "case() with number predicate (coerced to bool)",
 			input:    "case(1, 'a', 'b')",
-			expected: AnyType{},
+			expected: StringType{},
 		},
 		{
 			what:     "case() with string predicate (coerced to bool)",
 			input:    "case('yes', 'a', 'b')",
-			expected: AnyType{},
+			expected: StringType{},
 		},
 		{
 			what:     "case() with null predicate (coerced to bool)",
 			input:    "case(null, 'a', 'b')",
-			expected: AnyType{},
+			expected: StringType{},
 		},
 		{
 			what:     "case() case insensitivity",
 			input:    "CASE(true, 1, 2)",
-			expected: AnyType{},
+			expected: NumberType{},
 		},
 		{
 			what:     "case() with expression as predicate",
 			input:    "case(startsWith('hello', 'he'), 'yes', 'no')",
-			expected: AnyType{},
+			expected: StringType{},
 		},
 		{
 			what:     "case() with many predicates",
 			input:    "case(false, 'a', false, 'b', false, 'c', true, 'd', 'default')",
-			expected: AnyType{},
+			expected: StringType{},
 		},
 	}
 
@@ -1388,6 +1388,363 @@ func TestExprSemanticsCheckError(t *testing.T) {
 					}
 				}
 				t.Fatalf("error %q did not match any expected error messages %#v", err.Error(), tc.expected)
+			}
+		})
+	}
+}
+
+// checkCaseExprForTest parses and checks one expression with all contexts and special functions
+// available. It returns the deduced type string and the reported errors.
+func checkCaseExprForTest(t *testing.T, input string) (string, []*ExprError) {
+	t.Helper()
+
+	p := NewExprParser()
+	e, err := p.Parse(NewExprLexer(input + "}}"))
+	if err != nil {
+		t.Fatalf("parse error for %q: %v", input, err)
+	}
+
+	allSPFuncs := []string{}
+	for f := range SpecialFunctionNames {
+		allSPFuncs = append(allSPFuncs, f)
+	}
+
+	c := NewExprSemanticsChecker(false, nil)
+	c.SetContextAvailability([]string{"github", "job", "jobs", "matrix", "steps", "needs", "env", "inputs", "secrets", "vars", "runner"})
+	c.SetSpecialFunctionAvailability(allSPFuncs)
+
+	ty, errs := c.Check(e)
+	return ty.String(), errs
+}
+
+func TestExprSemaCaseFuncResultType(t *testing.T) {
+	testCases := []struct {
+		what     string
+		input    string
+		wantType string
+		wantErrs []string // When non-nil, exactly these error substrings must be reported.
+	}{
+		// Merge examples from the specification. The `a`/`b` predicates in the description are
+		// replaced with valid predicates because predicate types never participate in the fold.
+		{
+			what:     "merge example: all string values",
+			input:    "case(true, 'x', false, 'y', 'z')",
+			wantType: "string",
+		},
+		{
+			what:     "merge example: number then string folds to string",
+			input:    "case(true, 1, 'two')",
+			wantType: "string",
+		},
+		{
+			what:     "merge example: bool then number falls back to any",
+			input:    "case(true, true, 1)",
+			wantType: "any",
+		},
+		{
+			// Note: github.event is a loose empty object and github.event.pull_request is therefore
+			// typed as any. ObjectType.Merge(AnyType) falls back to any, so this concrete expression
+			// is "any" rather than a merged object type. Merging two strict object branches is
+			// covered by the fromJSON() rows below.
+			what:     "github.event and its unknown property merge into any",
+			input:    "case(true, github.event, github.event.pull_request)",
+			wantType: "any",
+		},
+		{
+			what:     "left-to-right fold over several mixed value arguments",
+			input:    "case(true, 1, false, 'x', null)",
+			wantType: "any", // number -> string, then string -> null falls back to any
+		},
+		{
+			what:     "bool merged with string stays string",
+			input:    "case(true, false, 's')",
+			wantType: "string",
+		},
+
+		// Nested case() calls.
+		{
+			what:     "nested case with number result merges with outer string",
+			input:    "case(true, case(false, 1, 2), 'x')",
+			wantType: "string",
+		},
+		{
+			what:     "nested case which falls back to any poisons the fold",
+			input:    "case(true, case(false, true, 1), 'x')",
+			wantType: "any",
+		},
+
+		// Object values deduced from fromJSON() literals.
+		{
+			what:     "different strict object branches merge into union of properties",
+			input:    `case(true, fromJSON('{"a": 1}'), fromJSON('{"b": 2}'))`,
+			wantType: "{a: number; b: number}",
+		},
+		{
+			what:     "same property in object branches is merged recursively",
+			input:    `case(true, fromJSON('{"a": 1}'), fromJSON('{"a": "x"}'))`,
+			wantType: "{a: string}",
+		},
+		{
+			what:     "property defined on one merged object branch is accessible",
+			input:    `case(true, fromJSON('{"a": 1}'), fromJSON('{"b": 2}')).a`,
+			wantType: "number",
+		},
+		{
+			// ObjectType.Merge keeps strictness when both operands are strict (Mapped == nil), so
+			// accessing a property missing from BOTH branches is still diagnosed. This is a true
+			// positive: "c" exists in neither branch.
+			what:     "property missing from both strict object branches is rejected",
+			input:    `case(true, fromJSON('{"a": 1}'), fromJSON('{"b": 2}')).c`,
+			wantType: "any",
+			wantErrs: []string{
+				`property "c" is not defined in object type {a: number; b: number}`,
+			},
+		},
+
+		// Array values.
+		{
+			what:     "arrays of same element type merge into that array type",
+			input:    `case(true, fromJSON('[1, 2]'), fromJSON('[3]'))`,
+			wantType: "array<number>",
+		},
+		{
+			what:     "different array element types merge recursively",
+			input:    `case(true, fromJSON('[1]'), fromJSON('["x"]'))`,
+			wantType: "array<string>", // number.Merge(string) => string
+		},
+		{
+			// Note: with the existing ArrayType.Merge, when one side's element is any the result is
+			// the array<any> side (here the empty JSON array). Merge is used as-is.
+			what:     "empty JSON array on the left merges to array<any>",
+			input:    `case(true, fromJSON('[]'), fromJSON('[1]'))`,
+			wantType: "array<any>",
+		},
+		{
+			what:     "empty JSON array on the right merges to array<any>",
+			input:    `case(true, fromJSON('[1]'), fromJSON('[]'))`,
+			wantType: "array<any>",
+		},
+
+		// Null default / value.
+		{
+			what:     "null default value falls back to any",
+			input:    "case(true, 'a', null)",
+			wantType: "any",
+		},
+		{
+			what:     "null branch value falls back to any",
+			input:    "case(true, null, 'a')",
+			wantType: "any",
+		},
+		{
+			what:     "all null values keep null type",
+			input:    "case(true, null, false, null, null)",
+			wantType: "null",
+		},
+
+		// Single predicate (minimum 3 arguments).
+		{
+			what:     "single predicate with string values",
+			input:    "case(github.event_name == 'push', 'yes', 'no')",
+			wantType: "string",
+		},
+
+		// The exact runs-on example from the specification: string merged with string array falls
+		// back to any, matching the pre-existing permissive runs-on check.
+		{
+			what:     "runs-on example merges string with string array into any",
+			input:    `case(github.event_name == 'push', 'ubuntu-latest', fromJSON('["self-hosted", "linux"]'))`,
+			wantType: "any",
+		},
+
+		// Position example from the specification: number merged with string yields string.
+		{
+			what:     "timeout-minutes example yields string",
+			input:    "case(github.event_name == 'push', 10, 'long')",
+			wantType: "string",
+		},
+
+		// Logical expression values reuse checkLogicalOp/checkWithNarrowing through sema.check.
+		{
+			what:     "logical value with issue-384 narrowing keeps number",
+			input:    "case(true, ('foo' && 10) || 20, 30)",
+			wantType: "number",
+		},
+		{
+			what:     "logical value without narrowing yields string",
+			input:    "case(true, ('foo' && 10) && 20, 30)",
+			wantType: "string",
+		},
+		{
+			what:     "logical value whose merge falls back to any stays any",
+			input:    "case(true, true && 1, 2)",
+			wantType: "any",
+		},
+
+		// Predicates themselves may be logical combinations and are checked normally.
+		{
+			what:     "predicate combined with || is checked",
+			input:    "case(github.event_name == 'push' || github.event_name == 'release', 'a', 'b')",
+			wantType: "string",
+		},
+		{
+			what:     "negated predicate is checked",
+			input:    "case(!true, 1, 2)",
+			wantType: "number",
+		},
+
+		// Diagnostics inside predicates are preserved even though predicate types do not affect the
+		// result type.
+		{
+			what:     "undefined variable in predicate is still diagnosed",
+			input:    "case(not_defined_variable, 'a', 'b')",
+			wantType: "string",
+			wantErrs: []string{
+				`undefined variable "not_defined_variable"`,
+			},
+		},
+		{
+			what:     "undefined property in predicate is still diagnosed",
+			input:    "case(github.no_such_property, 'a', 'b')",
+			wantType: "string",
+			wantErrs: []string{
+				`property "no_such_property" is not defined in object type`,
+			},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.what, func(t *testing.T) {
+			gotType, errs := checkCaseExprForTest(t, tc.input)
+
+			if diff := cmp.Diff(tc.wantType, gotType); diff != "" {
+				t.Fatalf("type mismatch for %q\nwanted type string: %q\ngot: %q\ndiff:\n%s", tc.input, tc.wantType, gotType, diff)
+			}
+
+			if tc.wantErrs == nil {
+				if len(errs) != 0 {
+					t.Fatalf("expected no errors for %q but got %v", tc.input, errs)
+				}
+				return
+			}
+
+			if len(errs) != len(tc.wantErrs) {
+				t.Fatalf("expected %d errors %v for %q but got %d: %v", len(tc.wantErrs), tc.wantErrs, tc.input, len(errs), errs)
+			}
+
+		LoopWantErrs:
+			for _, want := range tc.wantErrs {
+				for _, err := range errs {
+					if strings.Contains(err.Error(), want) {
+						continue LoopWantErrs
+					}
+				}
+				t.Fatalf("no error containing %q in %v", want, errs)
+			}
+		})
+	}
+}
+
+func TestExprSemaCaseFuncEquivalentToLogicalOps(t *testing.T) {
+	// When v1 is a truthy literal (non-empty string or non-zero number), case(p, v1, v2) is
+	// runtime-equivalent to `p && v1 || v2`. The checker must deduce the same type for both forms.
+	// The predicate and v1 are parenthesized only to preserve the exact AST shape; parentheses are
+	// not represented in the expression AST.
+	testCases := []struct {
+		what string
+		pred string
+		v1   string
+		v2   string
+		want string
+	}{
+		{what: "string literals", v1: "'foo'", v2: "'bar'", want: "string"},
+		{what: "non-empty string vs number", v1: "'foo'", v2: "10", want: "string"},
+		{what: "non-empty string vs bool", v1: "'foo'", v2: "true", want: "string"},
+		{what: "non-empty string vs null", v1: "'foo'", v2: "null", want: "any"},
+		{what: "non-zero numbers", v1: "10", v2: "20", want: "number"},
+		{what: "non-zero number vs string", v1: "10", v2: "'bar'", want: "string"},
+		{what: "non-zero number vs bool", v1: "10", v2: "true", want: "any"},
+		{what: "non-zero number vs null", v1: "10", v2: "null", want: "any"},
+		{what: "string vs string array fromJSON", v1: "'foo'", v2: `fromJSON('["a"]')`, want: "any"},
+		{what: "number vs object fromJSON", v1: "10", v2: `fromJSON('{"a":1}')`, want: "any"},
+
+		// Predicate itself is a && / || / ! combination.
+		{what: "|| predicate", pred: "github.event_name == 'push' || github.actor == 'octocat'", v1: "'foo'", v2: "'bar'", want: "string"},
+		{what: "&& predicate", pred: "github.event_name == 'push' && !github.ref_protected", v1: "10", v2: "20", want: "number"},
+		{what: "negated predicate", pred: "!true", v1: "'foo'", v2: "'bar'", want: "string"},
+
+		// The value itself is a logical expression: sema.check already routes it through
+		// checkLogicalOp/checkWithNarrowing, so the parenthesized equivalent gets the same type.
+		{what: "logical value with narrowing", v1: "('foo' && 10) || 20", v2: "30", want: "number"},
+		{what: "logical value without narrowing", v1: "('foo' && 10) && 20", v2: "30", want: "string"},
+		{what: "&& value falling back to any", v1: "true && 1", v2: "2", want: "any"},
+		{what: "negated value", v1: "!true", v2: "false", want: "bool"},
+		{what: "logical default value", v1: "'foo'", v2: "1 || 2", want: "string"},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.what, func(t *testing.T) {
+			pred := tc.pred
+			if pred == "" {
+				pred = "github.event_name == 'push'"
+			}
+
+			caseSrc := fmt.Sprintf("case(%s, %s, %s)", pred, tc.v1, tc.v2)
+			logicalSrc := fmt.Sprintf("(%s) && (%s) || (%s)", pred, tc.v1, tc.v2)
+
+			caseTy, caseErrs := checkCaseExprForTest(t, caseSrc)
+			if len(caseErrs) != 0 {
+				t.Fatalf("case expression %q reported errors: %v", caseSrc, caseErrs)
+			}
+			logicalTy, logicalErrs := checkCaseExprForTest(t, logicalSrc)
+			if len(logicalErrs) != 0 {
+				t.Fatalf("logical expression %q reported errors: %v", logicalSrc, logicalErrs)
+			}
+
+			if caseTy != logicalTy {
+				t.Fatalf(
+					"type mismatch between equivalent forms:\n  %s => %q\n  %s => %q",
+					caseSrc, caseTy, logicalSrc, logicalTy,
+				)
+			}
+			if caseTy != tc.want {
+				t.Fatalf("wanted merged type %q but got %q for %s", tc.want, caseTy, caseSrc)
+			}
+		})
+	}
+}
+
+func TestExprSemaCaseFuncFalsyFirstValue(t *testing.T) {
+	// When v1 may be a falsy value (empty string, zero, null, or false), case(p, v1, v2) is NOT
+	// runtime-equivalent to `p && v1 || v2`: the &&/|| chain skips a falsy v1 and yields v2 even
+	// when p is true, whereas case() returns v1. These cases are therefore deliberately kept out of
+	// TestExprSemaCaseFuncEquivalentToLogicalOps. The checker does not model literal truthiness, so
+	// the two forms may still deduce the same static type string; that must not be read as runtime
+	// equivalence. This table only pins the case() result types and ensures the arguments check.
+	testCases := []struct {
+		what     string
+		v1       string
+		v2       string
+		wantType string
+	}{
+		{what: "empty string vs string", v1: "''", v2: "'bar'", wantType: "string"},
+		{what: "empty string vs number", v1: "''", v2: "0", wantType: "string"},
+		{what: "zero vs number", v1: "0", v2: "1", wantType: "number"},
+		{what: "zero vs string", v1: "0", v2: "''", wantType: "string"},
+		{what: "null vs string", v1: "null", v2: "'bar'", wantType: "any"},
+		{what: "false vs number", v1: "false", v2: "0", wantType: "any"},
+		{what: "false vs bool", v1: "false", v2: "true", wantType: "bool"},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.what, func(t *testing.T) {
+			src := fmt.Sprintf("case(github.event_name == 'push', %s, %s)", tc.v1, tc.v2)
+			got, errs := checkCaseExprForTest(t, src)
+			if len(errs) != 0 {
+				t.Fatalf("unexpected errors for %q: %v", src, errs)
+			}
+			if got != tc.wantType {
+				t.Fatalf("wanted type %q but got %q for %q", tc.wantType, got, src)
 			}
 		})
 	}

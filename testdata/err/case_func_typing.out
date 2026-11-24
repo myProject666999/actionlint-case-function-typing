@@ -1,0 +1,5 @@
+test.yaml:7:22: type of expression at "float number value" must be number but found type string [expression]
+test.yaml:12:14: type of expression at "runs-on" must be string or array but found type "number" [expression]
+test.yaml:18:15: type of expression at "matrix" must be object but found type string [expression]
+test.yaml:31:23: property "c" is not defined in object type {a: number; b: number} [expression]
+test.yaml:36:23: property "c" is not defined in object type {a: number; b: number} [expression]

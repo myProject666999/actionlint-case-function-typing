@@ -1,0 +1,37 @@
+on: push
+
+jobs:
+  timeout-job:
+    runs-on: ubuntu-latest
+    # case() result is string (number merged with string); number position rejects it.
+    timeout-minutes: ${{ case(github.event_name == 'push', 10, 'long') }}
+    steps:
+      - run: echo hello
+  runs-on-job:
+    # Both branches are numbers; runs-on requires string or array.
+    runs-on: ${{ case(github.event_name == 'push', 1, 2) }}
+    steps:
+      - run: echo hello
+  matrix-expr-job:
+    # Both branches are strings; the top-level matrix expression requires object or array.
+    strategy:
+      matrix: ${{ case(github.event_name == 'push', 'foo', 'bar') }}
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo hello
+  matrix-job:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        # Merged strict object type is {a: number; b: number}.
+        obj:
+          - ${{ case(github.event_name == 'push', fromJSON('{"a":1}'), fromJSON('{"b":2}')) }}
+    steps:
+      # ERROR: property "c" does not exist on the merged object type.
+      - run: echo ${{ matrix.obj.c }}
+  object-prop-job:
+    runs-on: ubuntu-latest
+    steps:
+      # ERROR: property "c" does not exist on either fromJSON() branch.
+      - run: |
+          echo ${{ case(github.event_name == 'push', fromJSON('{"a":1}'), fromJSON('{"b":2}')).c }}

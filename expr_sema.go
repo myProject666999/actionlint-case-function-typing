@@ -858,7 +858,7 @@ func checkFuncSignature(n *FuncCallNode, sig *FuncSignature, args []ExprType) *E
 	return nil
 }
 
-func (sema *ExprSemanticsChecker) checkBuiltinFuncCall(n *FuncCallNode, sig *FuncSignature) ExprType {
+func (sema *ExprSemanticsChecker) checkBuiltinFuncCall(n *FuncCallNode, sig *FuncSignature, args []ExprType) ExprType {
 	sema.checkSpecialFunctionAvailability(n)
 
 	// Special checks for specific built-in functions
@@ -899,10 +899,46 @@ func (sema *ExprSemanticsChecker) checkBuiltinFuncCall(n *FuncCallNode, sig *Fun
 	case "case":
 		if len(n.Args)%2 == 0 {
 			sema.errorf(n, "case() requires an odd number of arguments (pred/value pairs + default) but got %d", len(n.Args))
+			// Keep the previous permissive type for malformed calls so the odd-argument diagnostic
+			// does not cause additional cascading diagnostics.
+			return sig.Ret
 		}
+		return caseFuncResultType(args)
 	}
 
 	return sig.Ret
+}
+
+// caseFuncResultType derives the result type of case() from its value arguments.
+//
+//	case(pred1, val1, pred2, val2, ..., default)
+//
+// Predicates are at even indices (0, 2, ...), the corresponding values are at odd indices
+// (1, 3, ...), and the last argument is the default value. The result type is the left-to-right
+// fold of [ExprType.Merge] over all value arguments and the default value. It does not introduce
+// any fallback rule other than Merge(): when types conflict, Merge() falls back to any.
+//
+// Every argument was already checked by [ExprSemanticsChecker.check] before this function is called,
+// so logical expression values already went through checkLogicalOp/checkWithNarrowing. This keeps
+// the deduced type consistent with the equivalent `pred && val || default` expression (for truthy
+// values) without checking arguments twice.
+func caseFuncResultType(args []ExprType) ExprType {
+	var ty ExprType
+
+	merge := func(t ExprType) {
+		if ty == nil {
+			ty = t
+		} else {
+			ty = ty.Merge(t)
+		}
+	}
+
+	for i := 1; i < len(args)-1; i += 2 { // val1, val2, ...
+		merge(args[i])
+	}
+	merge(args[len(args)-1]) // default
+
+	return ty
 }
 
 func (sema *ExprSemanticsChecker) checkFuncCall(n *FuncCallNode) ExprType {
@@ -929,7 +965,7 @@ func (sema *ExprSemanticsChecker) checkFuncCall(n *FuncCallNode) ExprType {
 		err := checkFuncSignature(n, sig, tys)
 		if err == nil {
 			// When one of overload pass type check, overload was resolved correctly
-			return sema.checkBuiltinFuncCall(n, sig)
+			return sema.checkBuiltinFuncCall(n, sig, tys)
 		}
 		errs = append(errs, err)
 	}
